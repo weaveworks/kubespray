@@ -1,0 +1,8 @@
+- name: install weave gitops
+  hosts: kube-master[0] 
+  user: ubuntu
+  become_method: sudo
+  connection: ssh
+  gather_facts: no
+  roles:
+    - weave_gitops 

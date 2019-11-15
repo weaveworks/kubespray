@@ -97,3 +97,7 @@ target/
 # virtualenv
 venv/
 ENV/
+
+# weave specific
+.ssh/config
+weave/hosts.ini

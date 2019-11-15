@@ -1,0 +1,215 @@
+- name: install jq
+  apt:
+    name: jq
+
+- name: determining latest helm release
+  shell: >
+    echo -n
+    $(curl -s https://api.github.com/repos/helm/helm/releases/latest 2>
+    /dev/null | grep "tag_name" | sed -e 's/.*://'
+    -e 's/ *"//' -e 's/",//')
+  args:
+    executable: /bin/bash
+  register: tiller_latest_release
+
+- name: set latest tiller release
+  set_fact:
+    tiller_version: "{{ tiller_latest_release.stdout }}"
+
+- name: download tiller checksums
+  get_url:
+    url: "https://get.helm.sh/helm-{{ tiller_version }}-linux-amd64.tar.gz.sha256"
+    dest: /home/ubuntu/helm.tar.gz.sha256
+    force: yes
+
+- name: get checksum from file
+  shell: cat /home/ubuntu/helm.tar.gz.sha256
+  register: helm_checksum
+
+- name: download tiller
+  get_url:
+    url: "https://get.helm.sh/helm-{{ tiller_version }}-linux-amd64.tar.gz"
+    dest: /home/ubuntu/helm.tar.gz
+    checksum: sha256:"{{ helm_checksum.stdout }}"
+    force: yes
+
+- name: decompress download
+  unarchive:
+    src: /home/ubuntu/helm.tar.gz
+    dest: /home/ubuntu
+    remote_src: True
+
+- name: move helm binary
+  command: mv /home/ubuntu/linux-amd64/helm /usr/local/bin/helm
+
+- name: move tiller binary
+  command: mv /home/ubuntu/linux-amd64/tiller /usr/local/bin/tiller
+
+- name: remove download dir
+  file:
+    path: /home/ubuntu/linux-amd64
+    state: absent
+
+- name: remove checksum file
+  file:
+    path: /home/ubuntu/helm.tar.gz.sha256
+    state: absent
+
+- name: set tiller ServiceAccount
+  set_fact:
+    tiller_service_account_name: "tiller"
+
+- name: copy tiller rbac config
+  template:
+    src: tiller-rbac.yaml.j2
+    dest: /home/ubuntu/tiller-rbac.yaml
+
+- name: apply tiller rbac config
+  shell: >
+    kubectl apply --kubeconfig /etc/kubernetes/admin.conf
+    -f /home/ubuntu/tiller-rbac.yaml
+
+- name: helm init
+  shell: "helm init --service-account {{ tiller_service_account_name }}"
+  register: helm_init_result
+
+- name: helm init result
+  debug:
+    msg: "{{ helm_init_result.stdout_lines }}"
+
+- name: helm update
+  shell: helm repo update
+
+- name: check tiller status
+  shell: >
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    get pods -n kube-system -l name=tiller
+  register: tiller_pod_status
+  until: tiller_pod_status.stdout.find("Running") != -1
+  retries: 3
+  delay: 20
+
+- name: check if weave namespace already exists
+  shell: kubectl --kubeconfig /etc/kubernetes/admin.conf get ns
+  register: weave_ns
+
+- name: create weave namespace if needed
+  shell: kubectl --kubeconfig /etc/kubernetes/admin.conf create ns weave
+  when: weave_ns.stdout.find("weave") == -1
+
+- name: install weave cloud
+  shell: >
+    /usr/local/bin/helm upgrade --install --force --wait weave-cloud
+    --set token="{{ weave_token }}" --namespace weave stable/weave-cloud
+  register: weave_cloud_install
+
+- name: check install status
+  debug:
+    msg: "{{ weave_cloud_install.stdout_lines }}"
+
+- name: get gitlab host keys
+  shell: "ssh-keyscan {{ git_host }} >> /tmp/flux_known_hosts"
+  register: ssh_keyscan
+
+- name: get latest flux release download
+  shell: >
+         curl -s https://api.github.com/repos/fluxcd/flux/releases  |
+         jq -r '.[] | .assets[] | select(.name=="fluxctl_linux_amd64") |
+         .browser_download_url' | head -1
+  args:
+    executable: /bin/bash
+    warn: no
+  register: flux_latest_release_download_url
+
+- name: set flux url
+  set_fact:
+    flux_url: "{{ flux_latest_release_download_url.stdout }}"
+
+- name: download flux
+  get_url:
+    url: "{{ flux_url }}"
+    dest: /home/ubuntu/fluxctl
+    force: yes
+    mode: 0750
+
+- name: get flux ssh pub key
+  shell: >
+    /home/ubuntu/fluxctl identity --k8s-fwd-ns weave
+    --k8s-fwd-labels name="weave-flux-agent"
+  register: flux_ssh_key
+
+- name: print flux ssh pub key
+  debug:
+    msg: "{{ flux_ssh_key.stdout_lines }}"
+
+- name: add fluxcd helm repo
+  shell: helm repo add fluxcd https://charts.fluxcd.io
+
+- name: create ssh key for Helm/Helm Operator
+  command: ssh-keygen -q -N "" -f ./identity
+  args:
+    chdir: /home/ubuntu
+
+- name: check if infra namespace already exists
+  shell: kubectl --kubeconfig /etc/kubernetes/admin.conf get ns
+  register: infra_ns
+
+- name: create infra namespace if needed
+  shell: kubectl --kubeconfig /etc/kubernetes/admin.conf create ns infra
+  when: infra_ns.stdout.find("infra") == -1
+
+- name: create secret for infra helm ssh key
+  shell: >
+      kubectl -n infra create secret generic helm-ssh --from-file=./identity
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  args:
+    chdir: /home/ubuntu
+
+- name: create secret for infra helm operator ssh key
+  shell: >
+      kubectl -n infra create secret generic helm-operator-ssh --from-file=./identity
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  args:
+    chdir: /home/ubuntu
+
+- name: install flux and connect to weave cloud
+  shell: >
+     helm upgrade --install --wait flux-infra
+     --set git.url="{{ git_url }}"
+     --set token="{{ weave_token }}"
+     --set git.secretName=helm-ssh
+     --set-file ssh.known_hosts=/tmp/flux_known_hosts
+     --set helmOperator.create=true --set helmOperator.createCRD=true
+     --namespace infra fluxcd/flux
+  register: flux_install
+
+- name: check helm install status
+  debug:
+    msg: "{{ flux_install.stdout_lines }}"
+
+- name: get infra flux ssh pub key
+  shell: >
+    /home/ubuntu/fluxctl identity --k8s-fwd-ns infra --k8s-fwd-labels app="flux"
+  register: infra_flux_ssh_key
+
+- name: print infra flux ssh pub key
+  debug:
+    msg: "{{ infra_flux_ssh_key.stdout_lines }}"
+
+- name: remove /tmp/flux_known_hosts
+  file:
+    path: /tmp/flux_known_hosts
+    state: absent
+
+- name: remove private key
+  file:
+    path: /home/ubuntu/identity
+    state: absent
+
+- name: remove private key
+  file:
+    path: /home/ubuntu/identity.pub
+    state: absent
+

@@ -1,0 +1,15 @@
+---
+apiVersion: flux.weave.works/v1beta1
+kind: HelmRelease
+metadata:
+  name: kured 
+  namespace: infra
+  annotations:
+    flux.weave.works/automated: "true"
+spec:
+  chart:
+    git: https://github.com/helm/charts.git
+    path: stable/kured
+    ref: master
+  values:
+    replicaCount: 1
