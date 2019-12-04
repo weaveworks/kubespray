@@ -101,3 +101,4 @@ ENV/
 # weave specific
 .ssh/config
 weave/hosts.ini
+extra_playbooks/hosts.ini

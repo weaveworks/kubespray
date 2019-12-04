@@ -150,6 +150,12 @@
   tags:
     - mounts
 
+- name: allow incoming external traffic
+  iptables:
+    chain: INPUT
+    policy: ACCEPT  
+  become: yes
+
 - name: flush iptables
   iptables:
     table: "{{ item }}"
